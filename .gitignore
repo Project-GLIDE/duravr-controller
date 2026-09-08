@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+
+# raw capture data and diagnostic output (large, regeneratable)
+*.pcap
+*.pcapng
+diagnose_output/
+capture_output/
+.context/
+
+archive.zip
+
+.DS_Store
+
+# Claude/Agents
+.claude
+CLAUDE.md
+AGENTS.md

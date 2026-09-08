@@ -1,0 +1,374 @@
+<!doctype html>
+<title>Dura VR - Control</title>
+<style>
+  body {
+    max-width: 46em;
+    margin: 2em auto;
+    padding: 0 1em;
+    font-family: serif;
+    line-height: 1.5;
+  }
+
+  img#video {
+    display: block;
+    max-width: 100%;
+    margin: 1em auto;
+  }
+
+  table {
+    border-collapse: collapse;
+    margin: 1em 0;
+  }
+
+  th,
+  td {
+    border: 1px solid #888;
+    padding: 4px 10px;
+    text-align: left;
+    font-family: monospace;
+  }
+
+  th {
+    font-family: serif;
+  }
+
+  code {
+    font-family: monospace;
+  }
+
+  #status,
+  #keys {
+    font-family: monospace;
+    font-size: 0.95em;
+  }
+
+  .active {
+    font-weight: bold;
+    text-decoration: underline;
+  }
+
+  input#speedInput {
+    font-family: monospace;
+    width: 4em;
+  }
+</style>
+
+<body>
+
+  <h1>Protocol Dura VR: Local Control Interface</h1>
+
+  <p>
+    This page is a locally-run replacement for the original Dura VR companion
+    app, which no longer runs on modern Android. It talks directly to the
+    drone's WiFi video/control protocol, reverse-engineered from decompiling the
+    original APK and from packet captures of the app's real traffic. Everything
+    here runs on this machine; the drone's WiFi access point has no internet
+    access and no external server is involved.
+  </p>
+
+  <h2>Live video feed</h2>
+
+  <p>
+    The drone streams motion-JPEG frames over UDP to port 40000. This page's
+    backend reassembles those frames and re-serves them below as an ordinary
+    MJPEG-over-HTTP stream.
+  </p>
+
+  <img id="video" src="/stream.mjpg">
+
+  <h2>Controls</h2>
+
+  <p>
+    <span id="status">
+      Flight state (client-tracked, not confirmed by the drone): <b id="flight">grounded</b><br>
+      Live telemetry (type <code>0x0b</code> reading, see table below): <b id="telem">--</b><br>
+      Speed cap (max axis deflection from center, 0&ndash;127):
+      <input type="number" id="speedInput" min="0" max="127" value="35">
+      <button id="speedApply">apply</button>
+    </span>
+  </p>
+
+  <table>
+    <tr>
+      <th>Key</th>
+      <th>Action</th>
+    </tr>
+    <tr>
+      <td>Space</td>
+      <td>toggle takeoff / land</td>
+    </tr>
+    <tr>
+      <td>W / S</td>
+      <td>pitch forward / back</td>
+    </tr>
+    <tr>
+      <td>A / D</td>
+      <td>roll left / right</td>
+    </tr>
+    <tr>
+      <td>&larr; / &rarr;</td>
+      <td>yaw (rotate) left / right</td>
+    </tr>
+    <tr>
+      <td>&uarr; / &darr;</td>
+      <td>throttle up / down</td>
+    </tr>
+  </table>
+
+  <p id="keys"></p>
+
+  <h2>Protocol reference</h2>
+
+  <p>
+    All traffic (video, keepalive, telemetry, and control) is UDP between this
+    host and the drone at <code>192.168.0.1:40000</code>. Every packet starts
+    with the two-byte magic <code>63 63</code>, followed by a one-byte packet
+    type.
+  </p>
+
+  <table>
+    <tr>
+      <th>Type</th>
+      <th>Direction</th>
+      <th>Meaning</th>
+    </tr>
+    <tr>
+      <td><code>0x01</code></td>
+      <td>client &rarr; drone</td>
+      <td>heartbeat, sent every ~1s to keep the stream alive</td>
+    </tr>
+    <tr>
+      <td><code>0x01</code></td>
+      <td>drone &rarr; client</td>
+      <td>heartbeat reply / device identification</td>
+    </tr>
+    <tr>
+      <td><code>0x03</code></td>
+      <td>drone &rarr; client</td>
+      <td>video frame chunk (MJPEG, chunked to ~1454 bytes)</td>
+    </tr>
+    <tr>
+      <td><code>0x0a</code></td>
+      <td>client &rarr; drone</td>
+      <td>joystick / button control, 18 bytes</td>
+    </tr>
+    <tr>
+      <td><code>0x0b</code></td>
+      <td>drone &rarr; client</td>
+      <td>telemetry, 15 bytes, streamed continuously (~10Hz)</td>
+    </tr>
+  </table>
+
+  <p>Control packet (type <code>0x0a</code>) byte layout:</p>
+
+  <table>
+    <tr>
+      <th>Offset</th>
+      <th>Size</th>
+      <th>Field</th>
+    </tr>
+    <tr>
+      <td>0&ndash;1</td>
+      <td>2</td>
+      <td>magic <code>63 63</code></td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>1</td>
+      <td>type <code>0x0a</code></td>
+    </tr>
+    <tr>
+      <td>3&ndash;4</td>
+      <td>2</td>
+      <td>reserved, <code>00 00</code></td>
+    </tr>
+    <tr>
+      <td>5&ndash;6</td>
+      <td>2</td>
+      <td>constant <code>0b 00</code></td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>1</td>
+      <td>constant <code>0x66</code></td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>1</td>
+      <td>axis A (paired with axis B)</td>
+    </tr>
+    <tr>
+      <td>9</td>
+      <td>1</td>
+      <td>axis B</td>
+    </tr>
+    <tr>
+      <td>10</td>
+      <td>1</td>
+      <td>axis C (paired with axis D)</td>
+    </tr>
+    <tr>
+      <td>11</td>
+      <td>1</td>
+      <td>axis D</td>
+    </tr>
+    <tr>
+      <td>12&ndash;14</td>
+      <td>3</td>
+      <td>constant <code>80 80 80</code> (unused axis)</td>
+    </tr>
+    <tr>
+      <td>15</td>
+      <td>1</td>
+      <td>flags: base <code>0x0c</code>; +<code>0x10</code> takeoff; +<code>0x40</code> land</td>
+    </tr>
+    <tr>
+      <td>16</td>
+      <td>1</td>
+      <td>checksum: XOR of bytes 8&ndash;15</td>
+    </tr>
+    <tr>
+      <td>17</td>
+      <td>1</td>
+      <td>constant <code>0x99</code></td>
+    </tr>
+  </table>
+
+  <p>
+    All 4 axis bytes are centered at <code>0x80</code> (neutral), range
+    <code>0x00</code>&ndash;<code>0xFF</code>. The mapping from axis byte to
+    physical stick direction is a best guess pending live confirmation.
+  </p>
+
+  <p>Telemetry packet (type <code>0x0b</code>) byte layout:</p>
+
+  <table>
+    <tr>
+      <th>Offset</th>
+      <th>Size</th>
+      <th>Field</th>
+    </tr>
+    <tr>
+      <td>0&ndash;1</td>
+      <td>2</td>
+      <td>magic <code>63 63</code></td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>1</td>
+      <td>type <code>0x0b</code></td>
+    </tr>
+    <tr>
+      <td>3&ndash;4</td>
+      <td>2</td>
+      <td>reserved, <code>00 00</code></td>
+    </tr>
+    <tr>
+      <td>5&ndash;6</td>
+      <td>2</td>
+      <td>constant <code>0f 00</code> (packet length, 15)</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>1</td>
+      <td>constant <code>0x66</code></td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>1</td>
+      <td>constant <code>0x64</code></td>
+    </tr>
+    <tr>
+      <td>9&ndash;10</td>
+      <td>2</td>
+      <td>live value. Byte 10 (signed) is the part that actually
+        changes, observed drifting slowly in roughly the -60..0 range while grounded and idle. Meaning
+        unconfirmed (candidate: a gyro/rate or vertical-speed reading). This is what's shown live above.</td>
+    </tr>
+    <tr>
+      <td>11&ndash;12</td>
+      <td>2</td>
+      <td>constant <code>00 00</code></td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td>1</td>
+      <td>checksum: XOR of bytes 8&ndash;12</td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td>1</td>
+      <td>constant <code>0x99</code></td>
+    </tr>
+  </table>
+
+  <script>
+    const KEYS = ["ArrowLeft", "ArrowUp", "ArrowDown", "ArrowRight", "w", "a", "s", "d"];
+    const keysP = document.getElementById("keys");
+    const els = {};
+    for (const k of KEYS) {
+      const el = document.createElement("span");
+      el.textContent = k;
+      el.style.marginRight = "1em";
+      keysP.appendChild(el);
+      els[k] = el;
+    }
+
+    function post(path, body) {
+      fetch(path, {
+        method: "POST", body: body ? JSON.stringify(body) : undefined,
+        headers: body ? { "Content-Type": "application/json" } : {}
+      });
+    }
+
+    const held = new Set();
+    window.addEventListener("keydown", (e) => {
+      if (e.repeat) return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        post("/toggle");
+        return;
+      }
+      const key = e.key;
+      if (KEYS.includes(key)) {
+        e.preventDefault();
+        if (!held.has(key)) {
+          held.add(key);
+          els[key].classList.add("active");
+          post("/key", { key, down: true });
+        }
+      }
+    });
+    window.addEventListener("keyup", (e) => {
+      const key = e.key;
+      if (KEYS.includes(key)) {
+        e.preventDefault();
+        held.delete(key);
+        els[key].classList.remove("active");
+        post("/key", { key, down: false });
+      }
+      if (e.code === "Space") e.preventDefault();
+    });
+
+    document.getElementById("speedApply").addEventListener("click", () => {
+      const v = parseInt(document.getElementById("speedInput").value, 10);
+      if (!isNaN(v)) post("/speed", { max_deflection: v });
+    });
+
+    let speedInputFocused = false;
+    const speedInput = document.getElementById("speedInput");
+    speedInput.addEventListener("focus", () => speedInputFocused = true);
+    speedInput.addEventListener("blur", () => speedInputFocused = false);
+
+    setInterval(async () => {
+      try {
+        const r = await fetch("/state");
+        const s = await r.json();
+        document.getElementById("flight").textContent = s.airborne ? "airborne (guess)" : "grounded";
+        document.getElementById("telem").textContent =
+          s.telemetry === null ? "no data yet" : `${s.telemetry} (${s.telemetry_age.toFixed(1)}s ago)`;
+        if (!speedInputFocused) speedInput.value = s.max_deflection;
+      } catch (e) { }
+    }, 1000);
+  </script>
+</body>
