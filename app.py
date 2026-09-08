@@ -8,17 +8,22 @@ Uses only the Python standard library.
 
 Usage
 -----
-python3 app.py [--drone-ip 192.168.0.1] [--drone-port 40000]
-               [--http-port 8090] [--max-deflection 35]
+usage: app.py [-h] [--drone-ip DRONE_IP] [--drone-port DRONE_PORT]
+              [--http-port HTTP_PORT] [--max-deflection MAX_DEFLECTION]
+
+options:
+  -h, --help            show this help message and exit
+  --drone-ip DRONE_IP
+  --drone-port DRONE_PORT
+  --http-port HTTP_PORT
+  --max-deflection MAX_DEFLECTION
+                        Speed cap: max axis distance from centre (0-127).
+                        Uncapped by default.
 
 While joined to the drone's WiFi access point, open http://localhost:8090/
 
-Notes
------
-The axis to key mapping in KEY_MAP is a best guess, not yet confirmed
-against a live flight. The speed cap (--max-deflection, also adjustable
-from the page) limits how far any control axis can move from its centre
-regardless of what key combination is held.
+This controls a real, physical drone. See DISCLAIMER.md for full safety,
+liability, and accuracy disclaimers before flying.
 """
 import argparse
 import json
@@ -39,29 +44,54 @@ TELEMETRY_LEN = 15
 CTRL_HEADER = bytes([0x63, 0x63, 0x0a, 0x00, 0x00, 0x0b, 0x00, 0x66])
 CTRL_TRAILER = 0x99
 AXIS_CENTER = 0x80
-FLAG_BASE = 0x0c
+FLAG_BASE_NORMAL = 0x0c
+FLAG_BASE_HIGHSPEED = 0x04  # baseline while high-speed mode is active (bit 0x08 cleared)
 FLAG_TAKEOFF = 0x10
-FLAG_LAND = 0x40
+FLAG_LAND = 0x20  # landing
+FLAG_STOP = 0x40  # emergency motor cutoff
+FLAG_COMPASS = 0x02  # set while compass mode is active, persists until toggled off; no key bound to it yet
 CTRL_SEND_INTERVAL = 0.05  # roughly 20Hz, matches the drone's expected rate
-BUTTON_BURST_DURATION = 0.4  # seconds to hold the takeoff/land flag
+BUTTON_BURST_DURATION = 0.4  # seconds to hold a one-shot flag, or to announce a baseline change
 
-DEFAULT_MAX_DEFLECTION = 35
 MAX_DEFLECTION_LIMIT = 127  # axis bytes centre on 0x80, hard limit either direction
+DEFAULT_MAX_DEFLECTION = MAX_DEFLECTION_LIMIT  # uncapped unless --max-deflection is passed explicitly
 
 # Axis slot (0 = byte 8, 1 = byte 9, 2 = byte 10, 3 = byte 11) and sign that
-# each key drives. Not confirmed against a live flight yet. If a key moves
-# the drone the wrong way, flip its sign here. If it moves the wrong axis,
-# swap slots.
+# each key drives: 
+#   - slot 0 = right stick left/right, 
+#   - slot 1 = right stick up/down, 
+#   - slot 2 = left stick up/down, 
+#   - slot 3 = left stick left/right.
+#
+# Increasing byte value corresponds to right/up stick movement. If a key
+# moves the drone the wrong way, flip its sign here.
 KEY_MAP = {
-    "ArrowLeft":  (0, -1),   # yaw left
-    "ArrowRight": (0, +1),   # yaw right
-    "ArrowUp":    (1, +1),   # throttle up
-    "ArrowDown":  (1, -1),   # throttle down
-    "w": (3, +1),            # pitch forward
-    "s": (3, -1),            # pitch back
-    "a": (2, -1),            # roll left
-    "d": (2, +1),            # roll right
+    "ArrowLeft":  (3, -1),   # yaw left
+    "ArrowRight": (3, +1),   # yaw right
+    "ArrowUp":    (2, +1),   # throttle up
+    "ArrowDown":  (2, -1),   # throttle down
+    "w": (1, +1),            # pitch forward
+    "s": (1, -1),            # pitch back
+    "a": (0, -1),            # roll left
+    "d": (0, +1),            # roll right
 }
+
+
+def signed8(byte):
+    """
+    Interpret an unsigned byte (0-255) as a signed 8-bit integer (-128-127).
+
+    Parameters
+    ----------
+    byte : int
+        Value in the range 0-255.
+
+    Returns
+    -------
+    int
+        The same bit pattern, read as two's-complement signed.
+    """
+    return byte - 256 if byte > 127 else byte
 
 
 def xor_checksum(body):
@@ -85,7 +115,7 @@ def xor_checksum(body):
     return c
 
 
-def build_control_packet(axes, flags=FLAG_BASE):
+def build_control_packet(axes, flags=FLAG_BASE_NORMAL):
     """
     Build an 18-byte type 0x0a control packet.
 
@@ -94,7 +124,9 @@ def build_control_packet(axes, flags=FLAG_BASE):
     axes : sequence of int
         Four axis values (bytes 8 to 11), each centred on `AXIS_CENTER`.
     flags : int, optional
-        Flags byte (offset 15). Defaults to the idle baseline.
+        Complete flags byte (offset 15) to send, including baseline and
+        any one-shot action bits already combined by the caller. Defaults
+        to the normal idle baseline.
 
     Returns
     -------
@@ -105,23 +137,23 @@ def build_control_packet(axes, flags=FLAG_BASE):
     return CTRL_HEADER + body + bytes([xor_checksum(body), CTRL_TRAILER])
 
 
-def build_button_packet(flag_bit):
+def build_button_packet(flags):
     """
-    Build a control packet for a one-shot button press, with all axes
-    centred.
+    Build a control packet for a one-shot button press or a baseline
+    change, with all axes centred.
 
     Parameters
     ----------
-    flag_bit : int
-        Flag bit to set on top of the idle baseline, for example
-        `FLAG_TAKEOFF` or `FLAG_LAND`.
+    flags : int
+        Complete flags byte to send, for example a baseline already OR'd
+        with `FLAG_TAKEOFF`.
 
     Returns
     -------
     bytes
         Complete 18-byte control packet.
     """
-    return build_control_packet([AXIS_CENTER] * 4, FLAG_BASE | flag_bit)
+    return build_control_packet([AXIS_CENTER] * 4, flags)
 
 
 class FrameBuffer:
@@ -171,52 +203,64 @@ class TelemetryState:
     """
     Holds the most recent telemetry reading from the drone.
 
+    A type 0x0b packet carries battery, altitude, and gyro readings as
+    three independently-varying signed bytes at offsets 8, 9, and 10 (see
+    README.md's telemetry reference).
+
     Written to by the UDP reader thread whenever a type 0x0b packet
     arrives. Read by the HTTP handler serving `/state`.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.value = None
+        self.altitude = None  # byte 9
+        self.battery = None   # byte 8
+        self.gyro = None      # byte 10
         self.last_update = None
 
-    def update(self, value):
+    def update(self, battery, altitude, gyro):
         """Record a new telemetry reading."""
         with self._lock:
-            self.value = value
+            self.battery = battery
+            self.altitude = altitude
+            self.gyro = gyro
             self.last_update = time.monotonic()
 
     def snapshot(self):
         """
-        Return the current reading and its age.
+        Return the current readings and their age.
 
         Returns
         -------
-        tuple of (int or None, float or None)
-            The last reading and how many seconds ago it arrived, or
-            (None, None) if nothing has been received yet.
+        tuple of (int or None, int or None, int or None, float or None)
+            (battery, altitude, gyro, seconds since last update), or
+            all None if nothing has been received yet.
         """
         with self._lock:
             if self.value is None:
                 return None, None
             age = time.monotonic() - self.last_update
-            return self.value, age
+            return self.battery, self.altitude, self.gyro, age
 
 
 class ControlState:
     """
-    Tracks which control keys are currently held, the configured speed
-    cap, and a client-side guess at whether the drone is airborne.
+    Tracks which control keys are currently held, the fixed speed cap set
+    at startup, whether movement commands are currently allowed to send,
+    and the client-tracked flight and speed-mode state.
 
-    Written to by the HTTP handlers for `/key`, `/speed`, and `/toggle`.
-    Read by the control-sending loop to build outgoing packets.
+    Written to by the HTTP handlers for `/key`, `/toggle`, `/stop`,
+    `/speed_mode`, and `/remote`. Read by the control-sending loop to
+    build outgoing packets.
     """
 
     def __init__(self, max_deflection):
         self._lock = threading.Lock()
         self.held_keys = set()
-        self.max_deflection = max_deflection
-        self.airborne = False  # client-side guess; the protocol itself has two one-shot buttons, not a toggle
+        self.max_deflection = max_deflection  # fixed for the process lifetime, set only via --max-deflection
+        self.airborne = False  # client-tracked flight status; the protocol only exposes one-shot takeoff/land buttons
+        self.high_speed = False  # client-tracked; the protocol's own bit is sticky, sent every packet while active
+        self.remote_enabled = True  # gates the movement stream; takeoff/land/stop send regardless
 
     def set_key(self, key, down):
         """Record that `key` is now held or released."""
@@ -226,27 +270,19 @@ class ControlState:
             else:
                 self.held_keys.discard(key)
 
-    def set_max_deflection(self, value):
-        """
-        Update the speed cap, clamped to a valid range.
-
-        Parameters
-        ----------
-        value : int
-            Requested maximum axis deflection from centre.
-
-        Returns
-        -------
-        int
-            The clamped value actually stored.
-        """
+    def toggle_remote(self):
+        """Flip whether movement commands are allowed to send, and return the new value."""
         with self._lock:
-            self.max_deflection = max(0, min(MAX_DEFLECTION_LIMIT, int(value)))
-            return self.max_deflection
+            self.remote_enabled = not self.remote_enabled
+            return self.remote_enabled
 
     def snapshot_axes(self):
         """
         Compute the four axis byte values for the currently held keys.
+
+        Returns centred axes and `False` unconditionally while
+        `remote_enabled` is `False`, regardless of what is actually held,
+        so no movement packet is sent at all until it is turned back on.
 
         Returns
         -------
@@ -254,6 +290,8 @@ class ControlState:
             The four axis values, and whether any mapped key is held.
         """
         with self._lock:
+            if not self.remote_enabled:
+                return [AXIS_CENTER] * 4, False
             keys = set(self.held_keys)
             cap = self.max_deflection
         axes = [AXIS_CENTER] * 4
@@ -265,11 +303,27 @@ class ControlState:
             axes[slot] = max(0, min(255, AXIS_CENTER + sign * cap))
         return axes, bool(keys & KEY_MAP.keys())
 
+    def baseline_flags(self):
+        """Return the current flags baseline (normal, or high-speed if active)."""
+        with self._lock:
+            return FLAG_BASE_HIGHSPEED if self.high_speed else FLAG_BASE_NORMAL
+
     def toggle_flight(self):
-        """Flip the client-side airborne guess and return the new value."""
+        """Flip the client-tracked flight state and return the new value."""
         with self._lock:
             self.airborne = not self.airborne
             return self.airborne
+
+    def set_grounded(self):
+        """Force the client-tracked flight state to grounded. Used after an emergency stop."""
+        with self._lock:
+            self.airborne = False
+
+    def toggle_high_speed(self):
+        """Flip the client-tracked speed mode and return the new value."""
+        with self._lock:
+            self.high_speed = not self.high_speed
+            return self.high_speed
 
 
 def udp_reader(sock, drone_addr, frame_buffer, telemetry_state, stop_event):
@@ -279,7 +333,9 @@ def udp_reader(sock, drone_addr, frame_buffer, telemetry_state, stop_event):
     Runs until `stop_event` is set. Starts a background thread sending a
     heartbeat to `drone_addr`, then loops reading from `sock`, publishing
     completed video frames to `frame_buffer` and telemetry readings to
-    `telemetry_state`.
+    `telemetry_state`. A frame is only published if its reassembled length
+    matches the length the first chunk declared (offset 12-13 of the
+    header) and it has valid JPEG start/end markers.
 
     Parameters
     ----------
@@ -307,6 +363,7 @@ def udp_reader(sock, drone_addr, frame_buffer, telemetry_state, stop_event):
     chunks = {}
     current_frame_id = None
     total_chunks_expected = None
+    declared_frame_len = None
 
     while not stop_event.is_set():
         try:
@@ -323,9 +380,11 @@ def udp_reader(sock, drone_addr, frame_buffer, telemetry_state, stop_event):
 
         if pkt_type == 0x0b:
             if len(data) >= TELEMETRY_LEN:
-                raw = data[10]
-                value = raw - 256 if raw > 127 else raw
-                telemetry_state.update(value)
+                telemetry_state.update(
+                    battery=data[8],  # observed range 11-34, unsigned reads naturally
+                    altitude=signed8(data[9]),
+                    gyro=signed8(data[10]),
+                )
             continue
 
         if pkt_type != 0x03:
@@ -342,6 +401,7 @@ def udp_reader(sock, drone_addr, frame_buffer, telemetry_state, stop_event):
         if frame_id != current_frame_id:
             current_frame_id = frame_id
             total_chunks_expected = total_chunks
+            declared_frame_len = struct.unpack("<H", data[12:14])[0]
             chunks = {}
 
         chunks[chunk_idx] = payload
@@ -352,7 +412,9 @@ def udp_reader(sock, drone_addr, frame_buffer, telemetry_state, stop_event):
             except KeyError:
                 chunks = {}
                 continue
-            if jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9"):
+            valid_markers = jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9")
+            valid_length = len(jpeg) == declared_frame_len
+            if valid_markers and valid_length:
                 frame_buffer.publish(jpeg)
             chunks = {}
 
@@ -380,15 +442,19 @@ def control_loop(sock, drone_addr, control_state, stop_event):
         axes, any_held = control_state.snapshot_axes()
         if any_held:
             try:
-                sock.sendto(build_control_packet(axes), drone_addr)
+                sock.sendto(build_control_packet(axes, flags=control_state.baseline_flags()), drone_addr)
             except OSError as e:
                 print(f"[udp] control send failed: {e}")
         stop_event.wait(CTRL_SEND_INTERVAL)
 
 
-def send_button_burst(sock, drone_addr, flag_bit):
+def send_button_burst(sock, drone_addr, flags):
     """
-    Send a takeoff or land command as a short burst of identical packets.
+    Send a one-shot action or a baseline change as a short burst of
+    identical packets, with all axes centred.
+
+    A single UDP packet is not reliable enough on its own, so the same
+    packet is repeated for a fixed duration instead.
 
     Parameters
     ----------
@@ -396,11 +462,12 @@ def send_button_burst(sock, drone_addr, flag_bit):
         Bound UDP socket to send on.
     drone_addr : tuple of (str, int)
         Drone address as (ip, port).
-    flag_bit : int
-        `FLAG_TAKEOFF` or `FLAG_LAND`.
+    flags : int
+        Complete flags byte to send, for example a baseline already OR'd
+        with `FLAG_TAKEOFF`, `FLAG_LAND`, or `FLAG_STOP`.
     """
     end = time.monotonic() + BUTTON_BURST_DURATION
-    pkt = build_button_packet(flag_bit)
+    pkt = build_button_packet(flags)
     while time.monotonic() < end:
         try:
             sock.sendto(pkt, drone_addr)
@@ -412,6 +479,10 @@ def send_button_burst(sock, drone_addr, flag_bit):
 INDEX_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
 with open(INDEX_HTML_PATH, "rb") as f:
     INDEX_HTML = f.read()
+
+DISCLAIMER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DISCLAIMER.md")
+with open(DISCLAIMER_PATH, "rb") as f:
+    DISCLAIMER_MD = f.read()
 
 
 def make_handler(frame_buffer, telemetry_state, control_state, sock, drone_addr):
@@ -425,9 +496,10 @@ def make_handler(frame_buffer, telemetry_state, control_state, sock, drone_addr)
     telemetry_state : TelemetryState
         Source for the telemetry value returned by `/state`.
     control_state : ControlState
-        State updated by `/key` and `/speed`, and read by `/state`.
+        State updated by `/key`, `/toggle`, `/stop`, `/speed_mode`, and
+        `/remote`, and read by `/state`.
     sock : socket.socket
-        Bound UDP socket used to send takeoff/land bursts.
+        Bound UDP socket used to send takeoff/land/stop bursts.
     drone_addr : tuple of (str, int)
         Drone address as (ip, port).
 
@@ -449,15 +521,25 @@ def make_handler(frame_buffer, telemetry_state, control_state, sock, drone_addr)
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(INDEX_HTML)
+            elif self.path == "/DISCLAIMER.md":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(DISCLAIMER_MD)))
+                self.end_headers()
+                self.wfile.write(DISCLAIMER_MD)
             elif self.path == "/stream.mjpg":
                 self._serve_stream()
             elif self.path == "/state":
-                telem_value, telem_age = telemetry_state.snapshot()
+                battery, altitude, gyro, telem_age = telemetry_state.snapshot()
                 body = json.dumps({
                     "airborne": control_state.airborne,
+                    "high_speed": control_state.high_speed,
+                    "remote_enabled": control_state.remote_enabled,
                     "max_deflection": control_state.max_deflection,
                     "max_deflection_limit": MAX_DEFLECTION_LIMIT,
-                    "telemetry": telem_value,
+                    "battery": battery,
+                    "altitude": altitude,
+                    "gyro": gyro,
                     "telemetry_age": telem_age,
                 }).encode()
                 self.send_response(200)
@@ -480,17 +562,28 @@ def make_handler(frame_buffer, telemetry_state, control_state, sock, drone_addr)
                 self._ok()
             elif self.path == "/toggle":
                 airborne = control_state.toggle_flight()
-                flag = FLAG_TAKEOFF if airborne else FLAG_LAND
+                action = FLAG_TAKEOFF if airborne else FLAG_LAND
+                flags = control_state.baseline_flags() | action
                 threading.Thread(
-                    target=send_button_burst, args=(sock, drone_addr, flag), daemon=True
+                    target=send_button_burst, args=(sock, drone_addr, flags), daemon=True
                 ).start()
                 self._ok()
-            elif self.path == "/speed":
-                try:
-                    data = json.loads(raw)
-                    control_state.set_max_deflection(data["max_deflection"])
-                except (ValueError, KeyError, TypeError):
-                    pass
+            elif self.path == "/stop":
+                control_state.set_grounded()
+                flags = control_state.baseline_flags() | FLAG_STOP
+                threading.Thread(
+                    target=send_button_burst, args=(sock, drone_addr, flags), daemon=True
+                ).start()
+                self._ok()
+            elif self.path == "/speed_mode":
+                control_state.toggle_high_speed()
+                flags = control_state.baseline_flags()
+                threading.Thread(
+                    target=send_button_burst, args=(sock, drone_addr, flags), daemon=True
+                ).start()
+                self._ok()
+            elif self.path == "/remote":
+                control_state.toggle_remote()
                 self._ok()
             else:
                 self.send_error(404)
@@ -526,9 +619,7 @@ def main():
     parser.add_argument("--http-port", type=int, default=8090)
     parser.add_argument(
         "--max-deflection", type=int, default=DEFAULT_MAX_DEFLECTION,
-        help="Speed cap: max axis distance from centre (0 to 127). Keep low "
-             f"until the key mapping is verified live (default: {DEFAULT_MAX_DEFLECTION}). "
-             "Also adjustable live from the webpage.",
+        help="Speed cap: max axis distance from centre (0-127). Uncapped by default.",
     )
     args = parser.parse_args()
 

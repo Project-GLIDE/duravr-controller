@@ -4,9 +4,12 @@ A local web interface for the Dura VR drone: live video feed and keyboard
 flight control from a browser, talking directly to the drone's own WiFi
 protocol. No cloud, no account.
 
+See [DISCLAIMER.md](DISCLAIMER.md) for safety and accuracy disclaimers
+before flying.
+
 ## Quick start
 
-```
+```sh
 python3 app.py
 ```
 
@@ -17,55 +20,93 @@ No dependencies: everything here is Python standard library only.
 
 Useful flags:
 
-```
-python3 app.py --drone-ip 192.168.0.1 --drone-port 40000 --http-port 8090 --max-deflection 35
+```sh
+python3 app.py --drone-ip 192.168.0.1 --drone-port 40000 --http-port 8090
 ```
 
-`--max-deflection` is the software speed cap (0 to 127, default 35): the
-maximum any control axis is allowed to move from centre, regardless of what
-key combination requests. Also adjustable live from the page.
+A `--max-deflection` flag exists to cap axis travel, but is not verified
+to work as intended.
 
 ## Status
 
-Confirmed working:
+Verified working:
 
 - Video feed.
-- Takeoff and land (spacebar).
+- Takeoff and landing, toggled with spacebar.
+- Emergency stop (`e`) cuts motor power immediately and fires
+  unconditionally, regardless of toggle state.
+- Speed mode toggle (`q`), between normal and high-speed.
+- Movement (WASD and arrow keys) drives the correct physical stick axis.
+- Compass-mode flag bit is understood but not wired up to any key.
+- The 3 trim controls (control packet bytes 12-14) are identified by name
+  from the original app's manual. Not wired up in `app.py` yet.
+- Remote-control gate (`o` key): a client-side switch that stops or
+  resumes sending movement commands. Correct by construction, since it
+  simply withholds packets this server would otherwise send.
+- Telemetry battery reading (shown live on the page).
 
-Present but not fully confirmed:
+Present but not fully verified:
 
-- Movement (WASD and arrow keys). Packets are protocol-correct, but the
-  mapping from key to physical direction is a guess pending a field test.
-  See the table below.
-- Telemetry reading (shown live on the page). The packet structure and its
-  checksum are confirmed; the physical meaning of the value itself is not.
+- The sign of each movement key, meaning which direction it actually moves
+  the drone.
+- Telemetry altitude and gyro readings (shown live on the page). Not yet
+  independently verified.
 - The exact delay a fresh connection needs before it will act on a takeoff
   command. In practice, letting `app.py` run for a while (tens of seconds)
-  before using the takeoff key has worked; no fixed minimum is established.
+  before using the takeoff key has worked; no fixed minimum is
+  established. Likely a sensor/IMU stabilization period on the drone
+  itself.
 
 Known issues:
 
-- Video frames occasionally arrive visibly corrupted (a solid colour band
-  partway down the frame). This appears to originate at the drone's own
-  camera encoder rather than in reassembly here: reconstructed frames match
-  their raw captured bytes exactly, and the corrupted ones still decode as
-  structurally valid JPEG.
+- Some video feed frames appear corrupted. The root cause is not known
+  yet.
 
 ## Axis mapping
 
-| Key | Slot, sign in `KEY_MAP` | Guessed as | Observed |
+| Key | Slot, sign in `KEY_MAP` | Action | Verified |
 |---|---|---|---|
-| ArrowLeft | slot 0, -1 | yaw left | |
-| ArrowRight | slot 0, +1 | yaw right | |
-| ArrowUp | slot 1, +1 | throttle up | |
-| ArrowDown | slot 1, -1 | throttle down | |
-| W | slot 3, +1 | pitch forward | |
-| S | slot 3, -1 | pitch back | |
-| A | slot 2, -1 | roll left | **down** (2026-08-24) |
-| D | slot 2, +1 | roll right | |
+| ArrowLeft | slot 3, -1 | yaw left | [x] |
+| ArrowRight | slot 3, +1 | yaw right | [x] |
+| ArrowUp | slot 2, +1 | throttle up | [ ] |
+| ArrowDown | slot 2, -1 | throttle down | [x] |
+| W | slot 1, +1 | pitch forward | [ ] |
+| S | slot 1, -1 | pitch back | [x] |
+| A | slot 0, -1 | roll left | [x] |
+| D | slot 0, +1 | roll right | [x] |
 
-`KEY_MAP` in `app.py` is left unchanged until the "Observed" column is
-filled in, so it can be corrected in one pass rather than piecemeal.
+`W` and `ArrowUp` remain unverified and should be treated with the same
+caution as any unverified key.
+
+Verified: which control packet byte reflects which
+physical stick axis, and that pushing the stick in the listed direction
+increases that byte's value. Each row is one byte in the raw control
+packet: for example, byte 8 is the right stick's left/right axis, and
+pushing that stick right increases byte 8's value up from its `0x80`
+centre (pushing left decreases it).
+
+| Byte offset | Physical stick axis | Increases toward |
+|---|---|---|
+| 8 | right stick, left/right | right |
+| 9 | right stick, up/down | up |
+| 10 | left stick, up/down | up |
+| 11 | left stick, left/right | right |
+
+`app.py`'s `KEY_MAP` uses the standard convention that right stick =
+pitch/roll and left stick = throttle/yaw, with increasing value meaning
+forward, right, climb, or clockwise respectively. That direction-of-travel
+part is not yet independently verified by an actual flight.
+
+The 3 trim controls (control packet bytes 12-14, sticky rather than
+spring-back) are named in the original app's manual:
+
+| Byte | Name | Location |
+|---|---|---|
+| 12 | forward/backward (pitch) trimmer | between the two sticks |
+| 13 | bank (roll) trimmer | below the right stick |
+| 14 | turn (yaw) trimmer | below the left stick |
+
+Each moves in steps of 2. Not wired up to any key in `app.py` yet.
 
 ## Protocol reference
 
@@ -85,29 +126,48 @@ on the running page itself.
 ### Video (type `0x03`)
 
 Every packet has an identical 54-byte header (magic, type, length, a
-per-frame `frame_id`, a `chunk_idx`/`total_chunks` pair, per-chunk payload
-length), followed by raw JPEG bytes for that chunk. Concatenating chunks
-`1..total_chunks` in order for one `frame_id` yields a complete standard
-JPEG (640x480, roughly 15fps).
+per-frame `frame_id`, a `chunk_idx`/`total_chunks` pair, a total-frame-length
+field, per-chunk payload length), followed by raw JPEG bytes for that
+chunk. Concatenating chunks `1..total_chunks` in order for one `frame_id`
+yields a complete standard JPEG (640x480, roughly 15fps).
+
+The total-frame-length field (offset 12-13 of the header) is verified:
+it matches the reassembled frame's actual byte length exactly, with zero
+mismatches across every frame checked. `app.py` rejects a frame if this
+doesn't match.
 
 ### Control (type `0x0a`)
 
 18 bytes, sent at ~20Hz while a stick is actively deflected, not sent
-continuously at idle.
+continuously at idle. Axis identity (which byte is which physical stick
+control) is in "Axis mapping" above.
 
-- 4 axis bytes, centred at `0x80` (neutral). Bytes 8+9 and 10+11 each pair
-  up as one physical stick; which stick drives which direction is the part
-  still unconfirmed (see "Axis mapping" above).
-- Flags byte (offset 15): baseline `0x0c`; `+0x10` = takeoff; `+0x40` =
-  land/stop.
+- 4 axis bytes, centred at `0x80` (neutral). Bytes 8+9 are the right
+  stick, 10+11 are the left stick.
+- A second set of 3 sticky axis-like bytes (offsets 12-14, the trim
+  controls), also centred at `0x80` with a narrower range (roughly
+  ±20-40). Unlike the primary 4 axes, these hold their value rather than
+  springing back to `0x80` when released.
+- Flags byte (offset 15): a baseline value, plus optional action bits
+  OR'd on top. The baseline is `0x0c` normally, or `0x04` while
+  high-speed mode is active (these two are alternatives, never combined).
+  Action bits, OR'd onto whichever baseline is current: `+0x10` takeoff,
+  `+0x20` landing, `+0x40` emergency stop (motor cutoff, drops the drone
+  immediately), `+0x02` compass mode is active. Takeoff/stop/land pulse
+  briefly; the high-speed baseline and compass mode are sticky, they
+  persist until toggled off again.
 - Checksum (offset 16) is the XOR of bytes 8 to 15.
 
 ### Telemetry (type `0x0b`)
 
 15 bytes, streamed continuously regardless of anything the client sends.
+Checksummed the same way as the control packet: offset 13 is the XOR of
+bytes 8 to 12. Three bytes vary independently, each with a distinct enough
+behavior to identify a role:
 
-- Checksummed the same way as the control packet: offset 13 is the XOR of
-  bytes 8 to 12.
-- The one byte that actually varies (offset 10, signed) drifts slowly over
-  tens of seconds while the drone sits idle.
-
+- Byte 8 (unsigned): verified: battery level. Decreases slowly and
+  monotonically, never observed to increase or reset.
+- Byte 9 (signed): might be altitude. The raw value tracked the original
+  app's displayed altitude closely in one comparison (displayed -0.9, raw
+  reading -1), though not matched byte-exactly.
+- Byte 10 (signed): might be a gyro rate or vibration reading.

@@ -36,8 +36,7 @@
     font-family: monospace;
   }
 
-  #status,
-  #keys {
+  #status {
     font-family: monospace;
     font-size: 0.95em;
   }
@@ -47,9 +46,56 @@
     text-decoration: underline;
   }
 
-  input#speedInput {
+  .keyboard {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 2em;
+    margin: 0.5em 0;
     font-family: monospace;
-    width: 4em;
+  }
+
+  .keyrow {
+    display: flex;
+  }
+
+  .keycap {
+    width: 1.8em;
+    height: 1.8em;
+    border: 1px solid #888;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 1px;
+  }
+
+  .keycap.spacer {
+    border: none;
+  }
+
+  .keycap.unused {
+    color: #bbb;
+    border-color: #ccc;
+  }
+
+  .keycap.spacebar {
+    width: 10em;
+  }
+
+  .keyrow.row-2 {
+    margin-left: 0.9em;
+  }
+
+  .keyrow.row-3 {
+    margin-left: 1.35em;
+  }
+
+  .keyrow.row-4 {
+    margin-left: 2.25em;
+  }
+
+  .keyrow.row-space {
+    justify-content: center;
   }
 </style>
 
@@ -63,7 +109,9 @@
     drone's WiFi video/control protocol, reverse-engineered from decompiling the
     original APK and from packet captures of the app's real traffic. Everything
     here runs on this machine; the drone's WiFi access point has no internet
-    access and no external server is involved.
+    access and no external server is involved. See
+    <a href="/DISCLAIMER.md">DISCLAIMER.md</a> for full safety, liability,
+    and accuracy disclaimers.
   </p>
 
   <h2>Live video feed</h2>
@@ -80,11 +128,15 @@
 
   <p>
     <span id="status">
-      Flight state (client-tracked, not confirmed by the drone): <b id="flight">grounded</b><br>
-      Live telemetry (type <code>0x0b</code> reading, see table below): <b id="telem">--</b><br>
-      Speed cap (max axis deflection from center, 0&ndash;127):
-      <input type="number" id="speedInput" min="0" max="127" value="35">
-      <button id="speedApply">apply</button>
+      Flight state (client-tracked): <b id="flight">grounded</b><br>
+      Speed mode (client-tracked): <b id="speedMode">normal</b><br>
+      Remote control: <b id="remoteEnabled">on</b><br>
+      Battery: <b id="battery">--</b><br>
+      Altitude: <b id="altitude">--</b><br>
+      Gyro/vibration: <b id="gyro">--</b>
+      <span id="telemAge"></span><br>
+      Speed cap (max axis deflection from center, 0&ndash;127, set at
+      startup with <code>--max-deflection</code>): <b id="maxDeflection">--</b>
     </span>
   </p>
 
@@ -95,7 +147,19 @@
     </tr>
     <tr>
       <td>Space</td>
-      <td>toggle takeoff / land</td>
+      <td>toggle takeoff / landing</td>
+    </tr>
+    <tr>
+      <td>e</td>
+      <td>emergency stop (motor cutoff, always fires)</td>
+    </tr>
+    <tr>
+      <td>q</td>
+      <td>toggle speed mode (normal / high-speed)</td>
+    </tr>
+    <tr>
+      <td>o</td>
+      <td>toggle remote control (stops or resumes sending movement)</td>
     </tr>
     <tr>
       <td>W / S</td>
@@ -115,7 +179,21 @@
     </tr>
   </table>
 
-  <p id="keys"></p>
+  <div class="keyboard" id="keys">
+    <div class="keycluster" id="mainKeyboard"></div>
+    <div class="keycluster">
+      <div class="keyrow">
+        <span class="keycap spacer"></span>
+        <span class="keycap" data-key="ArrowUp">&uarr;</span>
+        <span class="keycap spacer"></span>
+      </div>
+      <div class="keyrow">
+        <span class="keycap" data-key="ArrowLeft">&larr;</span>
+        <span class="keycap" data-key="ArrowDown">&darr;</span>
+        <span class="keycap" data-key="ArrowRight">&rarr;</span>
+      </div>
+    </div>
+  </div>
 
   <h2>Protocol reference</h2>
 
@@ -195,32 +273,52 @@
     <tr>
       <td>8</td>
       <td>1</td>
-      <td>axis A (paired with axis B)</td>
+      <td>right stick, left/right (confirmed: increasing value = right)</td>
     </tr>
     <tr>
       <td>9</td>
       <td>1</td>
-      <td>axis B</td>
+      <td>right stick, up/down (confirmed: increasing value = up)</td>
     </tr>
     <tr>
       <td>10</td>
       <td>1</td>
-      <td>axis C (paired with axis D)</td>
+      <td>left stick, up/down (confirmed: increasing value = up)</td>
     </tr>
     <tr>
       <td>11</td>
       <td>1</td>
-      <td>axis D</td>
+      <td>left stick, left/right (confirmed: increasing value = right)</td>
     </tr>
     <tr>
-      <td>12&ndash;14</td>
-      <td>3</td>
-      <td>constant <code>80 80 80</code> (unused axis)</td>
+      <td>12</td>
+      <td>1</td>
+      <td>forward/backward (pitch) trimmer, between the two sticks. Sticky
+        (holds its value rather than springing back to <code>0x80</code>),
+        moves in steps of 2.</td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td>1</td>
+      <td>bank (roll) trimmer, below the right stick. Sticky, steps of 2.</td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td>1</td>
+      <td>turn (yaw) trimmer, below the left stick. Sticky, steps of 2.</td>
     </tr>
     <tr>
       <td>15</td>
       <td>1</td>
-      <td>flags: base <code>0x0c</code>; +<code>0x10</code> takeoff; +<code>0x40</code> land</td>
+      <td>a baseline value, plus optional action bits OR'd on top. Baseline
+        is <code>0x0c</code> normally, or <code>0x04</code> while
+        high-speed mode is active (these two are alternatives, never
+        combined). Action bits, OR'd onto whichever baseline is current:
+        +<code>0x10</code> takeoff, +<code>0x20</code> landing,
+        +<code>0x40</code> emergency stop (motor cutoff, drops the drone
+        immediately), +<code>0x02</code> compass mode active. Takeoff/
+        stop/land pulse briefly; the high-speed baseline and compass mode
+        are sticky, they persist until toggled off again.</td>
     </tr>
     <tr>
       <td>16</td>
@@ -236,8 +334,10 @@
 
   <p>
     All 4 axis bytes are centered at <code>0x80</code> (neutral), range
-    <code>0x00</code>&ndash;<code>0xFF</code>. The mapping from axis byte to
-    physical stick direction is a best guess pending live confirmation.
+    <code>0x00</code>&ndash;<code>0xFF</code>. Which byte is which physical
+    stick axis is verified. Whether moving a stick in that direction makes
+    the drone move the way you'd expect follows standard convention has
+    not been independently verified by an actual flight.
   </p>
 
   <p>Telemetry packet (type <code>0x0b</code>) byte layout:</p>
@@ -276,14 +376,20 @@
     <tr>
       <td>8</td>
       <td>1</td>
-      <td>constant <code>0x64</code></td>
+      <td>battery, verified: decreases slowly and monotonically, never
+        observed to increase or reset.</td>
     </tr>
     <tr>
-      <td>9&ndash;10</td>
-      <td>2</td>
-      <td>live value. Byte 10 (signed) is the part that actually
-        changes, observed drifting slowly in roughly the -60..0 range while grounded and idle. Meaning
-        unconfirmed (candidate: a gyro/rate or vertical-speed reading). This is what's shown live above.</td>
+      <td>9</td>
+      <td>1</td>
+      <td>altitude, not yet verified. Tracked the original app's
+        displayed altitude closely in one comparison (displayed -0.9, raw
+        reading -1), though not matched byte-exactly.</td>
+    </tr>
+    <tr>
+      <td>10</td>
+      <td>1</td>
+      <td>gyro/vibration, not yet verified.</td>
     </tr>
     <tr>
       <td>11&ndash;12</td>
@@ -303,15 +409,47 @@
   </table>
 
   <script>
-    const KEYS = ["ArrowLeft", "ArrowUp", "ArrowDown", "ArrowRight", "w", "a", "s", "d"];
-    const keysP = document.getElementById("keys");
+    const MOVEMENT_KEYS = ["ArrowLeft", "ArrowUp", "ArrowDown", "ArrowRight", "w", "a", "s", "d"];
+    const USED_MAIN_KEYS = new Set(["w", "a", "s", "d", "e", "q", "o"]);
+    const KEY_ROWS = [
+      ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
+      ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
+      ["a", "s", "d", "f", "g", "h", "j", "k", "l"],
+      ["z", "x", "c", "v", "b", "n", "m"],
+    ];
+
     const els = {};
-    for (const k of KEYS) {
-      const el = document.createElement("span");
-      el.textContent = k;
-      el.style.marginRight = "1em";
-      keysP.appendChild(el);
-      els[k] = el;
+    const mainKeyboard = document.getElementById("mainKeyboard");
+    KEY_ROWS.forEach((row, i) => {
+      const rowEl = document.createElement("div");
+      rowEl.className = `keyrow row-${i + 1}`;
+      for (const k of row) {
+        const used = USED_MAIN_KEYS.has(k);
+        const keyEl = document.createElement("span");
+        keyEl.className = "keycap" + (used ? "" : " unused");
+        keyEl.textContent = k.toUpperCase();
+        keyEl.dataset.key = k;
+        rowEl.appendChild(keyEl);
+        if (used) els[k] = keyEl;
+      }
+      mainKeyboard.appendChild(rowEl);
+    });
+    const spaceRow = document.createElement("div");
+    spaceRow.className = "keyrow row-space";
+    const spaceEl = document.createElement("span");
+    spaceEl.className = "keycap spacebar";
+    spaceEl.textContent = "space";
+    spaceRow.appendChild(spaceEl);
+    mainKeyboard.appendChild(spaceRow);
+    els["Space"] = spaceEl;
+
+    for (const k of MOVEMENT_KEYS) {
+      if (!els[k]) els[k] = document.querySelector(`.keycap[data-key="${k}"]`);
+    }
+
+    function flash(el) {
+      el.classList.add("active");
+      setTimeout(() => el.classList.remove("active"), 150);
     }
 
     function post(path, body) {
@@ -326,11 +464,27 @@
       if (e.repeat) return;
       if (e.code === "Space") {
         e.preventDefault();
+        flash(els["Space"]);
         post("/toggle");
         return;
       }
+      if (e.key === "e") {
+        flash(els["e"]);
+        post("/stop");
+        return;
+      }
+      if (e.key === "q") {
+        flash(els["q"]);
+        post("/speed_mode");
+        return;
+      }
+      if (e.key === "o") {
+        flash(els["o"]);
+        post("/remote");
+        return;
+      }
       const key = e.key;
-      if (KEYS.includes(key)) {
+      if (MOVEMENT_KEYS.includes(key)) {
         e.preventDefault();
         if (!held.has(key)) {
           held.add(key);
@@ -341,7 +495,7 @@
     });
     window.addEventListener("keyup", (e) => {
       const key = e.key;
-      if (KEYS.includes(key)) {
+      if (MOVEMENT_KEYS.includes(key)) {
         e.preventDefault();
         held.delete(key);
         els[key].classList.remove("active");
@@ -350,24 +504,19 @@
       if (e.code === "Space") e.preventDefault();
     });
 
-    document.getElementById("speedApply").addEventListener("click", () => {
-      const v = parseInt(document.getElementById("speedInput").value, 10);
-      if (!isNaN(v)) post("/speed", { max_deflection: v });
-    });
-
-    let speedInputFocused = false;
-    const speedInput = document.getElementById("speedInput");
-    speedInput.addEventListener("focus", () => speedInputFocused = true);
-    speedInput.addEventListener("blur", () => speedInputFocused = false);
-
     setInterval(async () => {
       try {
         const r = await fetch("/state");
         const s = await r.json();
-        document.getElementById("flight").textContent = s.airborne ? "airborne (guess)" : "grounded";
-        document.getElementById("telem").textContent =
-          s.telemetry === null ? "no data yet" : `${s.telemetry} (${s.telemetry_age.toFixed(1)}s ago)`;
-        if (!speedInputFocused) speedInput.value = s.max_deflection;
+        document.getElementById("flight").textContent = s.airborne ? "airborne" : "grounded";
+        document.getElementById("speedMode").textContent = s.high_speed ? "high-speed" : "normal";
+        document.getElementById("remoteEnabled").textContent = s.remote_enabled ? "on" : "off";
+        document.getElementById("battery").textContent = s.battery === null ? "no data yet" : s.battery;
+        document.getElementById("altitude").textContent = s.altitude === null ? "no data yet" : s.altitude;
+        document.getElementById("gyro").textContent = s.gyro === null ? "no data yet" : s.gyro;
+        document.getElementById("telemAge").textContent =
+          s.telemetry_age === null ? "" : ` (${s.telemetry_age.toFixed(1)}s ago)`;
+        document.getElementById("maxDeflection").textContent = `${s.max_deflection}/${s.max_deflection_limit}`;
       } catch (e) { }
     }, 1000);
   </script>
