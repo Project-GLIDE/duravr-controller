@@ -237,8 +237,8 @@ class TelemetryState:
             all None if nothing has been received yet.
         """
         with self._lock:
-            if self.value is None:
-                return None, None
+            if self.last_update is None:
+                return None, None, None, None
             age = time.monotonic() - self.last_update
             return self.battery, self.altitude, self.gyro, age
 
